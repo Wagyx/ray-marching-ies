@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<title>three.js webgl - raymarching - IES Light</title>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+	<link type="text/css" rel="stylesheet" href="./main.css">
+	<style type="text/css">
+		html,
+		body {
+			height: 100%;
+		}
+
+		#container {
+			width: 100%;
+			height: 100%;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+		}
+	</style>
+</head>
+
+<body>
+
+	<div id="info">
+		<a href="https://threejs.org" target="_blank" rel="noopener">three.js</a> - webgl raymarching example<br />
+	</div>
+	<div id="container">
+		<canvas id="canvas"></canvas>
+	</div>
+
+	<script id="fragment_shader" type="x-shader/x-fragment">
+			precision highp float;
+			uniform float lightIntensity;
+			uniform float rotationAngle;
+			uniform vec3 lightPosition;
+			uniform vec2 resolution;
+
+			uniform mat4 viewMatrix;
+			uniform vec3 cameraPosition;
+
+			uniform mat4 cameraWorldMatrix;
+			uniform mat4 cameraProjectionMatrixInverse;
+
+			uniform sampler2D intensityMap; 
+
+			const int MAX_MARCHING_STEPS = 255;
+			const float MIN_DIST = 0.0;
+			const float MAX_DIST = 100.0;
+			const float EPSILON = 0.0001;
+			const float PI = 3.141592653589793;
+			
+			float dot2( in vec3 v ) { return dot(v,v); }
+			
+			float sdPlane( vec3 p, vec3 n, float h ) {
+				// n must be normalized
+				return dot(p,n) + h;
+			}
+			
+			float sdSphere( vec3 p, float s ) {
+				return length(p)-s;
+			}
+			
+			float sdBox( vec3 p, vec3 b ) {
+				vec3 d = abs(p) - b;
+				return min(max(d.x,max(d.y,d.z)),0.0) + length(max(d,0.0));
+			}
+		
+			
+			float opU( float d1, float d2 ) {
+				return min(d1,d2);
+			}
+			
+			struct Ray {
+				vec3 origin;
+				vec3 direction;
+			};
+			
+			
+			/**
+			 * Return the normalized direction to march in from the eye point for a single pixel.
+			 * 
+			 * fieldOfView: vertical field of view in degrees
+			 * size: resolution of the output image
+			 * fragCoord: the x,y coordinate of the pixel in the output image
+			 */
+			vec3 rayDirection(float fieldOfView, vec2 size, vec2 fragCoord) {
+				vec2 xy = fragCoord - size * 0.5;
+				float z = size.y / tan(radians(fieldOfView) * 0.5);
+				return normalize(vec3(xy, z));
+			}
+			
+			/**
+			 * Signed distance function describing the scene.
+			 * 
+			 * Absolute value of the return value indicates the distance to the surface.
+			 * Sign indicates whether the point is inside or outside the surface,
+			 * negative indicating inside.
+			 */
+			float sceneSDF(vec3 samplePoint) {
+				float res = 1e10;
+				res = opU(res, sdSphere(samplePoint-vec3(1.0,-1.5,-1.), 0.5));
+				res = opU(res, sdBox(samplePoint-vec3(-1.0,-1.5,1.), vec3(0.5,0.5,0.5)));
+				
+				float size=2.;
+				float thickness=0.01;
+				res = opU(res, sdBox(samplePoint-vec3(0.0,-size,0.0),vec3(size,thickness,size)));
+				res = opU(res, sdBox(samplePoint-vec3(0.0,size,0.0),vec3(size,thickness,size)));
+				res = opU(res, sdBox(samplePoint-vec3(-size,0.0,0.0),vec3(thickness,size,size)));
+				res = opU(res, sdBox(samplePoint-vec3(size,0.0,0.0),vec3(thickness,size,size)));
+				res = opU(res, sdBox(samplePoint-vec3(0.0,0.0,size),vec3(size,size,thickness)));
+				//res = opU(res, sdBox(samplePoint-vec3(0.0,0.0,-size),vec3(size,size,thickness)));
+				return res;
+			}
+			
+			
+			
+			/**
+			 * Using the gradient of the SDF, estimate the normal on the surface at point p.
+			 */
+			vec3 estimateNormal(vec3 p) {
+				return normalize(vec3(
+					sceneSDF(vec3(p.x + EPSILON, p.y, p.z)) - sceneSDF(vec3(p.x - EPSILON, p.y, p.z)),
+					sceneSDF(vec3(p.x, p.y + EPSILON, p.z)) - sceneSDF(vec3(p.x, p.y - EPSILON, p.z)),
+					sceneSDF(vec3(p.x, p.y, p.z  + EPSILON)) - sceneSDF(vec3(p.x, p.y, p.z - EPSILON))
+				));
+			}
+			
+			/**
+			 * Return the shortest distance from the eyepoint to the scene surface along
+			 * the marching direction. If no part of the surface is found between start and end,
+			 * return end.
+			 * 
+			 * eye: the eye point, acting as the origin of the ray
+			 * marchingDirection: the normalized direction to march in
+			 * start: the starting distance away from the eye
+			 * end: the max distance away from the ey to march before giving up
+			 */
+			float shortestDistanceToSurface(vec3 eye, vec3 marchingDirection, float start, float end) {
+				float depth = start;
+				for (int i = 0; i < MAX_MARCHING_STEPS; i++) {
+					float dist = sceneSDF(eye + depth * marchingDirection);
+					if (dist < EPSILON) {
+						return depth;
+					}
+					depth += dist;
+					if (depth >= end) {
+						return end;
+					}
+				}
+				return end;
+			}
+
+			vec3 cart2sph(vec3 cart) {
+				// cartesian z is up
+				//sph is radius, inclination (from z), azimuth
+				vec3 sph;
+				sph.x = 1.0;
+				sph.y = acos(cart.y);
+				sph.z = atan(cart.z, cart.x);
+				//sph.z = mod(sph.z,2.*PI);
+				return sph;
+			}
+			
+			
+			////////////////////////////////////////////////////////
+			// MAIN
+			////////////////////////////////////////////////////////
+			
+			void main( void) {
+				// screen position
+				vec2 screenPos = ( gl_FragCoord.xy * 2.0 - resolution ) / resolution;
+
+				// ray direction in normalized device coordinate
+				vec4 ndcRay = vec4( screenPos.xy, 1.0, 1.0 );
+
+				// convert ray direction from normalized device coordinate to world coordinate
+				vec3 rayDir = ( cameraWorldMatrix * cameraProjectionMatrixInverse * ndcRay ).xyz;
+				rayDir = normalize( rayDir );
+
+				// camera position
+				vec3 cPos = cameraPosition;
+
+				Ray ray = Ray(cPos,rayDir);
+
+				// compute intersection     
+				float dist = shortestDistanceToSurface(ray.origin,ray.direction, MIN_DIST, MAX_DIST);
+				if (dist > MAX_DIST - EPSILON) {
+					// Didn't hit anything
+					gl_FragColor = vec4(0.03,0.03,0.03, 1.0);
+					return;
+				}
+				vec3 hitPoint = ray.origin + dist * ray.direction;
+				vec3 hitPointNormal = estimateNormal(hitPoint);
+				
+				
+				vec3 lightPos = lightPosition;
+				vec3 lightAxis = vec3(0.0,1.0,0.0); //for vertical axis
+							
+				vec3 dirToLight = lightPos-hitPoint;
+				float distToLight = length(dirToLight);
+				dirToLight = dirToLight/distToLight;
+				
+				ray = Ray(lightPos, -dirToLight);
+				dist = shortestDistanceToSurface(ray.origin,ray.direction, MIN_DIST, MAX_DIST);
+				float col = 0.0;
+				if (abs(dist - distToLight) < 0.001) {
+					// lightColor is the point light intensity
+					vec3 sph = cart2sph(dirToLight);
+					vec2 coord = vec2( mod(sph.z+rotationAngle,2.*PI)/(2.0*PI),sph.y/PI);
+					col = texture2D(intensityMap, coord).x;
+					// because it is a point light, we need to convert to irradiance
+					col *= dot(hitPointNormal, dirToLight)/(distToLight*distToLight);
+				}
+				
+				col = pow(col * 4. * lightIntensity,0.45);
+				// Output to screen
+				gl_FragColor = vec4(col,col,col,1.0);
+			}
+
+		</script>
+
+	<script id="vertex_shader" type="x-shader/x-vertex">
+		attribute vec3 position;
+		void main(void) {
+			gl_Position = vec4(position, 1.0);
+		}
+	</script>
+
+	<script type="importmap">
+		{
+			"imports": {
+				"three": "./js/three.module.js"
+			}
+		}
+	</script>
+
+	<script type="module">
+
+		import * as THREE from 'three';
+
+		import Stats from './js/stats.module.js';
+		import { GUI } from './js/lil-gui.module.min.js';
+
+		import { OrbitControls } from './js/OrbitControls.js';
+		import { IESLoader, IESLamp } from './js/IESLoader2.js';
+		//import { LDTLoader, LDTLamp } from './jsm/loaders/LDTLoader.js';
+
+		let camera, scene, renderer;
+		let geometry, material, mesh, gLamp;
+		let stats, clock;
+
+		const canvas = document.querySelector('#canvas');
+
+		const config = {
+			saveImage: function () {
+				renderer.render(scene, camera);
+				window.open(canvas.toDataURL());
+			},
+			resolution: '512',
+			lightIntensity: 1,
+			rotationAngle: 0,
+			lightX: 0,
+			lightY: 0,
+			lightZ: 0,
+		};
+
+		init();
+		render();
+
+		function init() {
+
+			renderer = new THREE.WebGLRenderer({ canvas: canvas });
+			renderer.setPixelRatio(window.devicePixelRatio);
+			renderer.setSize(parseInt(config.resolution), parseInt(config.resolution));
+			//renderer.setSize(window.innerWidth, window.innerHeight);
+
+			window.addEventListener('resize', onWindowResize);
+
+			// THREE.Scene
+			scene = new THREE.Scene();
+
+			clock = new THREE.Clock();
+
+			//const filename = '1a936937a49c63374e6d4fbed9252b29.ies';
+			//const filename = '02a7562c650498ebb301153dbbf59207.ies';
+			//const filename = '06b4cfdc8805709e767b5e2e904be8ad.ies';
+			//const filename = '007cfb11e343e2f42e3b476be4ab684e.ies';
+			//const filename = 'CB1948PSX-LNW850-CL.IES';
+			//const filename = 'CB1210-2LF13.IES';
+			const filename = 'CB1900-NGT.IES';
+			const iesLoader = new IESLoader().setPath('./ies/');
+			iesLoader.load(filename,
+				// called when resource is loaded
+				function (object) {
+					geometry = new THREE.PlaneGeometry(2.0, 2.0);
+					material = new THREE.RawShaderMaterial({
+						uniforms: {
+							resolution: { value: new THREE.Vector2(canvas.width, canvas.height) },
+							cameraWorldMatrix: { value: camera.matrixWorld },
+							cameraProjectionMatrixInverse: { value: camera.projectionMatrixInverse.clone() },
+							intensityMap: { value: object },
+							lightPosition: { value: new THREE.Vector3(config.lightX,config.lightY,config.lightZ) },
+							lightIntensity: { value: config.lightIntensity },
+							rotationAngle: { value: config.rotationAngle },
+						},
+						vertexShader: document.getElementById('vertex_shader').textContent,
+						fragmentShader: document.getElementById('fragment_shader').textContent
+					});
+					mesh = new THREE.Mesh(geometry, material);
+					mesh.frustumCulled = false;
+					scene.add(mesh);
+				},
+				// called when loading is in progresses
+				function (xhr) {
+					console.log((xhr.loaded / xhr.total * 100) + '% loaded');
+				},
+				// called when loading has errors
+				function (error) {
+					console.log('An error happened when loading', filename);
+					console.log(error);
+				}
+			);
+
+
+			camera = new THREE.PerspectiveCamera(90, canvas.width / canvas.height, 1, 200);
+			camera.position.z = -4;
+			scene.add(camera);
+
+
+			// Controls
+			const controls = new OrbitControls(camera, canvas);
+			controls.enableZoom = true;
+
+			// GUI
+			const gui = new GUI();
+			//gui.add(config, 'saveImage').name('Save Image');
+			gui.add(config, 'resolution', ['256', '512', '800', 'full']).name('Resolution').onChange(onWindowResize);
+			gui.add(config, 'lightIntensity', 0.1,10).name('Intensity').onChange(function (value) {
+				material.uniforms.lightIntensity.value = value;
+			});
+			gui.add(config, 'rotationAngle', 0.0, 360.0).name('Angle').onChange(function (value) {
+				material.uniforms.rotationAngle.value = Math.PI * value / 180.0;
+			});
+			gui.add(config, 'lightX', -2.0,2.0).name('Light X').onChange(function (value) {
+				material.uniforms.lightPosition.value.x = value;
+			});
+			gui.add(config, 'lightY', -2.0,2.0).name('Light Y').onChange(function (value) {
+				material.uniforms.lightPosition.value.y = value;
+			});
+			gui.add(config, 'lightZ', -2.0,2.0).name('Light Z').onChange(function (value) {
+				material.uniforms.lightPosition.value.z = value;
+			});
+			config.inputFileButton = "";
+			gui.add(config, 'inputFileButton').name('<input type="file" id="fileInput">');
+			gui.open();
+
+			// INPUT FILES FROM USER
+			const fileInputElement = document.getElementById('fileInput');
+			fileInputElement.addEventListener('change', function (e) {
+				const files = fileInputElement.files;
+				function processFile(file) {
+					const reader = new FileReader();
+					reader.onload = function (e) {
+						if (/\.ies$/i.test(file.name)) {
+							material.uniforms.intensityMap.value = new IESLoader().parse(this.result);
+						}
+						//else if (/\.ldt$/i.test(file.name)) {
+						//	material.uniforms.intensityMap.value = new LDTLoader().parse(this.result);
+						//}
+					}
+					reader.readAsText(file);
+				}
+
+				if (files) {
+					processFile(files[0]);
+				}
+			});
+
+			stats = new Stats();
+			document.body.appendChild(stats.dom);
+		}
+
+		function onWindowResize() {
+			if (config.resolution === 'full') {
+				renderer.setSize(window.innerWidth, window.innerHeight);
+			} else {
+				renderer.setSize(parseInt(config.resolution), parseInt(config.resolution));
+			}
+			camera.aspect = canvas.width / canvas.height;
+			camera.updateProjectionMatrix();
+			material.uniforms.resolution.value.set(canvas.width, canvas.height);
+			material.uniforms.cameraProjectionMatrixInverse.value.copy(camera.projectionMatrixInverse);
+		}
+
+		function render() {
+			stats.begin();
+			const elapsedTime = clock.getElapsedTime();
+			renderer.render(scene, camera);
+			stats.end();
+			requestAnimationFrame(render);
+		}
+
+
+	</script>
+
+</body>
+
+</html>
